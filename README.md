@@ -1,4 +1,4 @@
-# Neural Trading Engine (baseline)
+# Neural Trading Engine
 Backend-only prototype for a quant engine. 
 - Data: yfinance OHLCV
 - Features: TA indicators
