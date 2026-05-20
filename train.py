@@ -1,56 +1,95 @@
-import argparse, json
+from __future__ import annotations
+
+import argparse
+import json
 from pathlib import Path
+
+import joblib
 import pandas as pd
+from sklearn.metrics import roc_auc_score
+
 from config import Config
 from data import load_or_fetch
 from features import make_features, train_test_split_time
-from models.baseline import BaselineModels
-from utils import ensure_dirs
+from models import BaselineModels, NeuralSignalModel
+from utils import ensure_dirs, set_global_seed
 
-def fit_and_save(model_name: str, X_tr, y_tr, out_fp: Path):
+
+def build_model(model_name: str):
     if model_name == "logreg":
-        model = BaselineModels.logreg()
-    elif model_name == "rf":
-        from config import Config
-        model = BaselineModels.rf(Config.rf_n_estimators, Config.rf_max_depth, Config.random_state)
-    else:
-        raise ValueError("model_name must be one of {logreg, rf}")
+        return BaselineModels.logreg(seed=Config.seed)
+    if model_name == "rf":
+        return BaselineModels.rf(
+            n_estimators=Config.rf_n_estimators,
+            max_depth=Config.rf_max_depth,
+            random_state=Config.seed,
+        )
+    if model_name == "nn":
+        return NeuralSignalModel(
+            hidden_size=Config.nn_hidden_size,
+            dropout=Config.nn_dropout,
+            lr=Config.nn_lr,
+            weight_decay=Config.nn_weight_decay,
+            epochs=Config.nn_epochs,
+            batch_size=Config.nn_batch_size,
+            seed=Config.seed,
+        )
+    raise ValueError("model_name must be one of {logreg, rf, nn}")
 
+
+def train_single_ticker(model_name: str, ticker: str, df: pd.DataFrame) -> dict:
+    feat_df = make_features(df)
+    X_tr, y_tr, X_te, y_te, cols = train_test_split_time(feat_df, Config.test_split_date)
+
+    model = build_model(model_name)
     model.fit(X_tr, y_tr)
-    out_fp.parent.mkdir(parents=True, exist_ok=True)
-    import joblib; joblib.dump(model, out_fp)
-    return model
+
+    p_te = pd.Series(model.predict_proba(X_te)[:, 1], index=X_te.index)
+    auc = float(roc_auc_score(y_te, p_te))
+
+    model_fp = Path(Config.artifacts_dir) / f"model_{model_name}_{ticker}.joblib"
+    joblib.dump(model, model_fp)
+
+    meta = {
+        "ticker": ticker,
+        "model": model_name,
+        "rows_train": int(len(X_tr)),
+        "rows_test": int(len(X_te)),
+        "features": cols,
+        "auc_test": auc,
+        "split_date": Config.test_split_date,
+    }
+    Path(Config.artifacts_dir, f"train_meta_{model_name}_{ticker}.json").write_text(
+        json.dumps(meta, indent=2)
+    )
+    return meta
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tickers", nargs="+", required=True)
     ap.add_argument("--start", required=True)
     ap.add_argument("--end", required=True)
-    ap.add_argument("--model", choices=["logreg","rf"], default="rf")
+    ap.add_argument("--model", choices=["logreg", "rf", "nn"], default="rf")
     args = ap.parse_args()
 
+    set_global_seed(Config.seed)
     ensure_dirs(Config.artifacts_dir)
-    data = load_or_fetch(args.tickers, args.start, args.end)
 
-    # For now, single ticker training (extend to multi later)
-    t = args.tickers[0]
-    f = make_features(data[t])
-    X_tr, y_tr, X_te, y_te, cols = train_test_split_time(f, Config.test_split_date)
+    raw = load_or_fetch(args.tickers, args.start, args.end)
 
-    model_fp = Path(Config.artifacts_dir) / f"model_{args.model}_{t}.joblib"
-    model = fit_and_save(args.model, X_tr, y_tr, model_fp)
+    summary = []
+    for ticker in args.tickers:
+        meta = train_single_ticker(args.model, ticker, raw[ticker])
+        summary.append(meta)
 
-    meta = {
-        "ticker": t,
-        "start": args.start,
-        "end": args.end,
-        "features": cols,
-        "model": args.model,
-        "rows_train": len(X_tr),
-        "rows_test": len(X_te),
-    }
-    Path(Config.artifacts_dir, f"train_meta_{t}.json").write_text(json.dumps(meta, indent=2))
-    print("Saved:", model_fp, "\nMeta:", meta)
+    out = Path(Config.artifacts_dir, f"train_summary_{args.model}.json")
+    out.write_text(json.dumps(summary, indent=2))
+
+    print(f"Saved training artifacts in {Config.artifacts_dir}")
+    for row in summary:
+        print(f"{row['ticker']}: test AUC={row['auc_test']:.4f} rows(train/test)=({row['rows_train']}/{row['rows_test']})")
+
 
 if __name__ == "__main__":
     main()
